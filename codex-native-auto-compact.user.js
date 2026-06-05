@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.2.0
+// @version      0.2.1
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -14,6 +14,7 @@
   const CONFIG_STORAGE_KEY = "codexNativeAutoCompactConfig";
   const DEFAULT_CONFIG = {
     thresholdUsedPercent: 82,
+    contextWindowOverride: 73728,
     pollIntervalMs: 5000,
     cooldownMs: 10 * 60 * 1000,
     menuOpenDelayMs: 650,
@@ -281,6 +282,24 @@
       usedTokens,
       contextWindow,
       remainingTokens,
+    };
+  }
+
+  function applyContextWindowOverride(reading, config) {
+    if (!reading) return null;
+
+    const overrideWindow = Number(config && config.contextWindowOverride);
+    if (!Number.isFinite(overrideWindow) || overrideWindow <= 0) return reading;
+    if (!Number.isFinite(Number(reading.usedTokens))) return reading;
+
+    const usedTokens = Number(reading.usedTokens);
+    const adjustedReading = makeUsageReading((usedTokens / overrideWindow) * 100, usedTokens, overrideWindow, reading.exact);
+    if (!adjustedReading) return reading;
+    return {
+      ...adjustedReading,
+      conversationId: reading.conversationId,
+      source: reading.source,
+      originalContextWindow: reading.contextWindow,
     };
   }
 
@@ -568,11 +587,16 @@
     if (cachedContextUsage.value && now - cachedContextUsage.at < CACHE_TTL_MS) {
       return cachedContextUsage.value;
     }
+    const config = readConfig();
     installCaptureHooks();
     const activeConversationId = readActiveConversationId();
-    const runtimeUsage = buildExactContextUsage(findExactContextUsage());
+    const runtimeUsage = findExactContextUsage();
+    const capturedUsage = activeConversationId ? capturedUsageByConversationId.get(activeConversationId) : null;
     const officialMenuUsage = findOfficialMenuContextUsage();
-    const usage = runtimeUsage || officialMenuUsage || approximateContextUsage();
+    const usage = applyContextWindowOverride(
+      runtimeUsage || capturedUsage || officialMenuUsage || approximateContextUsage(),
+      config,
+    );
     cachedContextUsage = { at: now, value: usage };
     return usage;
   }
@@ -734,7 +758,7 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.2.0",
+    version: "0.2.1",
     start,
     tick,
     readConfig,

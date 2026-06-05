@@ -34,6 +34,7 @@ Configuration is stored in `localStorage` under the key `codexNativeAutoCompactC
 ```javascript
 localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
   thresholdUsedPercent: 82,    // Compress when usage exceeds this percentage
+  contextWindowOverride: 73728, // Use llama-server -c / --ctx-size instead of Codex UI model_context_window
   pollIntervalMs: 5000,         // How often to check context usage (ms)
   cooldownMs: 600000,           // Cooldown between compressions per conversation (ms)
   menuOpenDelayMs: 650,         // Delay after opening context menu (ms)
@@ -42,6 +43,8 @@ localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
   debug: false                  // If true, log debug information
 }));
 ```
+
+Set `contextWindowOverride` to `0` or `null` to trust the context window reported by Codex. For a local `llama-server -c 73728`, keep it at `73728`; this prevents Codex Desktop metadata such as `258400` from making the used percentage look too low.
 
 ## How It Works
 
