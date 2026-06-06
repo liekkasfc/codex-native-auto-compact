@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.4.1
+// @version      0.4.2
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -28,6 +28,8 @@
     contextWindowDiscoveryTtlMs: 10 * 60 * 1000,
     minRemainingTokensBeforeCompact: 20000,
     pollIntervalMs: 5000,
+    busyRetryMs: 1000,
+    idleObserverDebounceMs: 150,
     cooldownMs: 2 * 60 * 1000,
     missingTriggerRetryMs: 10 * 1000,
     slashMenuOpenDelayMs: 650,
@@ -55,10 +57,14 @@
   // Auto Compact state
   const state = {
     timer: 0,
+    pendingTimer: 0,
+    idleObserverTimer: 0,
+    idleObserver: null,
     destroyed: false,
     running: false,
     compacting: false,
     compactingSince: null,
+    pendingCompact: null,
     lastAttemptByConversationId: new Map(),
     lastMissingTriggerByConversationId: new Map(),
     lastAction: null,
@@ -903,6 +909,73 @@
     if (readConfig().debug) console.log("[codex-native-auto-compact]", ...args);
   }
 
+  function clearPendingCompact(conversationId) {
+    if (!state.pendingCompact) return;
+    if (conversationId && state.pendingCompact.conversationId !== conversationId) return;
+    state.pendingCompact = null;
+    window.clearTimeout(state.pendingTimer);
+    state.pendingTimer = 0;
+  }
+
+  function markPendingCompact(reading, config, conversationId, decision) {
+    state.pendingCompact = {
+      at: new Date().toISOString(),
+      conversationId,
+      percent: reading && reading.percent,
+      threshold: Number(config.thresholdUsedPercent),
+      remainingTokens: reading && reading.remainingTokens,
+      minRemainingTokens: Number(config.minRemainingTokensBeforeCompact),
+      trigger: decision && decision.trigger || decision && decision.code,
+      reason: decision,
+    };
+  }
+
+  function schedulePendingTick(delayMs = 0) {
+    if (state.destroyed || !state.pendingCompact) return;
+    window.clearTimeout(state.pendingTimer);
+    state.pendingTimer = window.setTimeout(() => {
+      state.pendingTimer = 0;
+      if (!state.destroyed && state.pendingCompact && !state.running) tick();
+    }, Math.max(0, Number(delayMs) || 0));
+  }
+
+  function schedulePendingTickWhenIdle(delayMs = 0) {
+    if (state.destroyed || !state.pendingCompact) return;
+    window.clearTimeout(state.pendingTimer);
+    state.pendingTimer = window.setTimeout(() => {
+      state.pendingTimer = 0;
+      if (state.destroyed || !state.pendingCompact || state.running) return;
+      if (findBusyIndicator()) {
+        schedulePendingTick(Number(readConfig().busyRetryMs) || 1000);
+        return;
+      }
+      tick();
+    }, Math.max(0, Number(delayMs) || 0));
+  }
+
+  function installIdleObserver() {
+    if (state.idleObserver || typeof MutationObserver !== "function") return;
+    const target = document.body || document.documentElement;
+    if (!target) return;
+
+    state.idleObserver = new MutationObserver(() => {
+      if (state.destroyed || !state.pendingCompact || state.running) return;
+      window.clearTimeout(state.idleObserverTimer);
+      state.idleObserverTimer = window.setTimeout(() => {
+        state.idleObserverTimer = 0;
+        if (state.destroyed || !state.pendingCompact || state.running) return;
+        if (!findBusyIndicator()) schedulePendingTick(0);
+      }, Math.max(0, Number(readConfig().idleObserverDebounceMs) || 150));
+    });
+
+    state.idleObserver.observe(target, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["disabled", "aria-disabled", "aria-busy", "aria-live", "data-state", "class"],
+    });
+  }
+
   function setCompacting(compacting) {
     state.compacting = Boolean(compacting);
     state.compactingSince = compacting ? new Date().toISOString() : null;
@@ -1337,6 +1410,13 @@
       const conversationId = String(reading?.conversationId || readActiveConversationId() || "__unknown__");
       const decision = getAttemptDecision(reading, config, conversationId);
       if (!decision.ok) {
+        if (decision.code === "below-threshold") {
+          clearPendingCompact(conversationId);
+        }
+        if (decision.code === "busy") {
+          markPendingCompact(reading, config, conversationId, decision);
+          schedulePendingTickWhenIdle(Number(config.busyRetryMs) || 1000);
+        }
         if (decision.code !== "below-threshold") {
           state.lastSkip = { at: new Date().toISOString(), conversationId, ...decision };
           log("skip", state.lastSkip);
@@ -1344,6 +1424,7 @@
         return null;
       }
 
+      clearPendingCompact(conversationId);
       setCompacting(true, `${Math.round(Number(reading.percent))}%`);
       let result = await clickNativeCompact(config, {
         conversationId,
@@ -1394,6 +1475,7 @@
       }
 
       state.lastAction = { at: new Date().toISOString(), ...result, verification, fallback };
+      if (result.ok && verification && verification.ok) clearPendingCompact(conversationId);
       log("attempt", state.lastAction);
       return state.lastAction;
     } finally {
@@ -1404,14 +1486,17 @@
 
   function start() {
     window.clearInterval(state.timer);
+    window.clearTimeout(state.pendingTimer);
+    window.clearTimeout(state.idleObserverTimer);
     state.destroyed = false;
     state.timer = window.setInterval(tick, Math.max(1000, Number(readConfig().pollIntervalMs) || 5000));
+    installIdleObserver();
     tick();
   }
 
   // Export API
   window[API_KEY] = {
-    version: "0.4.1",
+    version: "0.4.2",
     start,
     tick,
     readConfig,
@@ -1428,6 +1513,7 @@
         running: state.running,
         compacting: state.compacting,
         compactingSince: state.compactingSince,
+        pendingCompact: state.pendingCompact,
         lastAction: state.lastAction,
         lastSkip: state.lastSkip,
         lastAttemptConversationIds: Array.from(state.lastAttemptByConversationId.keys()),
@@ -1436,8 +1522,12 @@
     },
     destroy() {
       state.destroyed = true;
+      clearPendingCompact();
       setCompacting(false);
       window.clearInterval(state.timer);
+      window.clearTimeout(state.idleObserverTimer);
+      state.idleObserver?.disconnect();
+      state.idleObserver = null;
       delete window[API_KEY];
     },
   };

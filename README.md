@@ -46,6 +46,8 @@ localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
   contextWindowDiscoveryTtlMs: 600000,
   minRemainingTokensBeforeCompact: 20000, // Also compact when remaining tokens fall below this buffer
   pollIntervalMs: 5000,         // How often to check context usage (ms)
+  busyRetryMs: 1000,            // Retry quickly when compact is pending but Codex is busy
+  idleObserverDebounceMs: 150,  // Debounce DOM idle detection before retrying pending compact
   cooldownMs: 120000,           // Cooldown between compressions per conversation (ms)
   missingTriggerRetryMs: 10000, // Short retry delay when the compact UI trigger is temporarily hidden
   slashMenuOpenDelayMs: 650,    // Delay after typing "/" to open the command menu (ms)
@@ -85,6 +87,7 @@ With a `73728` context window, keep `thresholdUsedPercent` around `65`-`70`. Nat
    - If no context menu trigger is visible, opens the slash command menu and selects the compact command
    - Clicks the compress button and confirms the action
    - Skips attempts while Codex appears busy if `onlyWhenIdle` is enabled
+   - Keeps a pending compact when usage is above threshold but Codex is busy, then retries immediately when the UI becomes idle
    - Uses a short retry delay instead of full cooldown when the compact trigger is temporarily missing
    - Verifies the result afterward and records `usage-reduced` or `usage-not-reduced`
 
