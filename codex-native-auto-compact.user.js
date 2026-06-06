@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.4.2
+// @version      0.4.3
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -16,6 +16,7 @@
     thresholdUsedPercent: 68,
     contextWindowOverride: null,
     forceContextWindowOverride: false,
+    unknownContextWindowFallback: null,
     modelContextWindowOverrides: {},
     providerContextWindowOverrides: {
       "llama.cpp": 73728,
@@ -561,12 +562,17 @@
     const discovered = discoveredContextWindowByKey.get(discoveryKey(reading));
     if (discovered && Number.isFinite(Number(discovered.value)) && Number(discovered.value) > 0) return Number(discovered.value);
 
+    const metadataText = String(reading && (reading.provider || reading.model || reading.baseUrl || "") || "").toLowerCase();
+    if (!metadataText) {
+      const unknownFallback = Number(config && config.unknownContextWindowFallback);
+      if (Number.isFinite(unknownFallback) && unknownFallback > 0) return unknownFallback;
+    }
+
     const globalOverride = Number(config && config.contextWindowOverride);
     if (!Number.isFinite(globalOverride) || globalOverride <= 0) return null;
 
-    const providerText = String(reading && (reading.provider || reading.model || reading.baseUrl || "") || "").toLowerCase();
-    if (!providerText) return config && config.forceContextWindowOverride ? globalOverride : null;
-    if (/openai|chatgpt|gpt-|gpt_/.test(providerText)) return null;
+    if (!metadataText) return config && config.forceContextWindowOverride ? globalOverride : null;
+    if (/openai|chatgpt|gpt-|gpt_/.test(metadataText)) return null;
     return globalOverride;
   }
 
@@ -1496,7 +1502,7 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.4.2",
+    version: "0.4.3",
     start,
     tick,
     readConfig,

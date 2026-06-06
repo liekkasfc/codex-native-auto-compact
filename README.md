@@ -36,6 +36,7 @@ localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
   thresholdUsedPercent: 68,    // Compress early enough to leave room for the compact request
   contextWindowOverride: null,  // Trust Codex/provider metadata unless an override is needed
   forceContextWindowOverride: false, // If true, apply contextWindowOverride even when provider is unknown
+  unknownContextWindowFallback: null, // Use only when provider/model/baseUrl are unavailable
   modelContextWindowOverrides: {}, // Optional model-name or /regex/ overrides
   providerContextWindowOverrides: {
     "llama.cpp": 73728,
@@ -67,6 +68,16 @@ localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
 ```
 
 Set `contextWindowOverride` to `0` or `null` to trust the context window reported by Codex. For a local `llama-server -c 73728`, prefer `providerContextWindowOverrides` or `modelContextWindowOverrides` instead of a global override; this prevents Codex Desktop metadata such as `258400` from making the used percentage look too low without incorrectly applying `73728` to GPT/OpenAI sessions.
+
+If Codex exposes token usage but does not expose `provider`, `model`, or `baseUrl`, set `unknownContextWindowFallback` to the real context window for that dedicated third-party API instance:
+
+```javascript
+localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
+  unknownContextWindowFallback: 73728
+}));
+```
+
+Leave it as `null` for mixed-provider Codex sessions, because different models can have different context windows.
 
 When `autoDiscoverContextWindow` is enabled, the script tries to discover a provider-reported context window from endpoints such as `/props`, `/v1/models`, and `/models`, then caches the result briefly. This works only when the provider exposes fields such as `context_length`, `max_context_length`, `max_model_len`, `n_ctx`, or `num_ctx` and the page is allowed to fetch that endpoint. If the provider does not expose the value or CORS blocks the request, use an override.
 
