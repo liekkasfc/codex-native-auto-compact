@@ -37,7 +37,7 @@
   const INSTALL_KEY = "__codexContextRingRestoreInstalled";
   const PANEL_VERSION = "context-ring-restore-3";
   const CACHE_TTL_MS = 1500;
-  const CAPTURE_TEXT_HINT_RE = /context|token|tokens|usage|window|budget|remaining|compress this conversation|压缩此对话的上下文|上下文|令牌|使用|窗口/i;
+  const CAPTURE_TEXT_HINT_RE = /context|token|tokens|usage|window|budget|remaining|compress this conversation|压缩此(?:对话|会话)的上下文|上下文|令牌|使用|窗口/i;
   const MAX_CAPTURE_TEXT_LENGTH = 800000;
 
   // Auto Compact state
@@ -569,7 +569,7 @@
       if (!(item instanceof Element)) continue;
       const text = item.textContent?.replace(/\s+/g, " ").trim() || "";
       if (!text) continue;
-      if (!/压缩此对话的上下文|compress this conversation/i.test(text)) continue;
+      if (!/压缩此(?:对话|会话)的上下文|compress this conversation/i.test(text)) continue;
       const percentMatch = /已使用\s*(\d{1,3}(?:\.\d+)?)%|used\s*(\d{1,3}(?:\.\d+)?)%/i.exec(text);
       if (!percentMatch) continue;
       const percent = firstFiniteNumber(percentMatch[1], percentMatch[2]);
