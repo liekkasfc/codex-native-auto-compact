@@ -46,6 +46,7 @@ localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
   verifyTimeoutMs: 60000,       // Maximum time spent waiting for usage to drop (ms)
   verifyPollIntervalMs: 3000,   // Poll interval while verifying compaction result (ms)
   verifyMinReductionTokens: 1000, // Minimum token drop considered a successful compact
+  showCompactIndicator: true,   // Show a small bottom-right indicator while compacting
   dryRun: false,                // If true, don't actually compress (for testing)
   debug: false                  // If true, log debug information
 }));
@@ -70,6 +71,7 @@ With a `73728` context window, keep `thresholdUsedPercent` around `65`-`70`. Nat
    - Clicks the compress button and confirms the action
    - Skips attempts while Codex appears busy if `onlyWhenIdle` is enabled
    - Verifies the result afterward and records `usage-reduced` or `usage-not-reduced`
+   - Shows a bottom-right `Auto compacting...` indicator while compaction is in progress
 
 3. **Conversation Isolation**: Each conversation is tracked independently with its own cooldown period to prevent excessive compression attempts.
 

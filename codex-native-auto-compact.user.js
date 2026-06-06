@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.3.0
+// @version      0.3.1
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -26,6 +26,7 @@
     verifyTimeoutMs: 60000,
     verifyPollIntervalMs: 3000,
     verifyMinReductionTokens: 1000,
+    showCompactIndicator: true,
     dryRun: false,
     debug: false,
   };
@@ -42,6 +43,8 @@
     timer: 0,
     destroyed: false,
     running: false,
+    compacting: false,
+    compactingSince: null,
     lastAttemptByConversationId: new Map(),
     lastAction: null,
     lastSkip: null,
@@ -628,6 +631,50 @@
     if (readConfig().debug) console.log("[codex-native-auto-compact]", ...args);
   }
 
+  function ensureCompactIndicator() {
+    const id = "codex-native-auto-compact-indicator";
+    let indicator = document.getElementById(id);
+    if (indicator) return indicator;
+
+    indicator = document.createElement("div");
+    indicator.id = id;
+    indicator.setAttribute("role", "status");
+    indicator.setAttribute("aria-live", "polite");
+    indicator.textContent = "Auto compacting...";
+    Object.assign(indicator.style, {
+      position: "fixed",
+      right: "16px",
+      bottom: "16px",
+      zIndex: "2147483647",
+      display: "none",
+      maxWidth: "260px",
+      padding: "10px 12px",
+      borderRadius: "8px",
+      background: "rgba(17, 24, 39, 0.94)",
+      color: "#fff",
+      font: "13px/1.35 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
+      boxShadow: "0 10px 30px rgba(0, 0, 0, 0.25)",
+      pointerEvents: "none",
+    });
+    document.documentElement.appendChild(indicator);
+    return indicator;
+  }
+
+  function setCompacting(compacting, detail = "") {
+    state.compacting = Boolean(compacting);
+    state.compactingSince = compacting ? new Date().toISOString() : null;
+
+    const config = readConfig();
+    if (!config.showCompactIndicator) return;
+    const indicator = ensureCompactIndicator();
+    if (compacting) {
+      indicator.textContent = detail ? `Auto compacting... ${detail}` : "Auto compacting...";
+      indicator.style.display = "block";
+    } else {
+      indicator.style.display = "none";
+    }
+  }
+
   function visible(element) {
     if (!(element instanceof Element)) return false;
     const style = window.getComputedStyle ? window.getComputedStyle(element) : null;
@@ -870,6 +917,7 @@
       }
 
       state.lastAttemptByConversationId.set(conversationId, Date.now());
+      setCompacting(true, `${Math.round(Number(reading.percent))}%`);
       const result = await clickNativeCompact(config, {
         conversationId,
         percent: reading.percent,
@@ -884,6 +932,7 @@
       log("attempt", state.lastAction);
       return state.lastAction;
     } finally {
+      setCompacting(false);
       state.running = false;
     }
   }
@@ -897,7 +946,7 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.3.0",
+    version: "0.3.1",
     start,
     tick,
     readConfig,
@@ -907,6 +956,8 @@
     getState() {
       return {
         running: state.running,
+        compacting: state.compacting,
+        compactingSince: state.compactingSince,
         lastAction: state.lastAction,
         lastSkip: state.lastSkip,
         lastAttemptConversationIds: Array.from(state.lastAttemptByConversationId.keys()),
@@ -914,6 +965,8 @@
     },
     destroy() {
       state.destroyed = true;
+      setCompacting(false);
+      document.getElementById("codex-native-auto-compact-indicator")?.remove();
       window.clearInterval(state.timer);
       delete window[API_KEY];
     },
