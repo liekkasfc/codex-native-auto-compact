@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.3.5
+// @version      0.4.0
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -14,7 +14,14 @@
   const CONFIG_STORAGE_KEY = "codexNativeAutoCompactConfig";
   const DEFAULT_CONFIG = {
     thresholdUsedPercent: 68,
-    contextWindowOverride: 73728,
+    contextWindowOverride: null,
+    forceContextWindowOverride: false,
+    providerContextWindowOverrides: {
+      "llama.cpp": 73728,
+      llamacpp: 73728,
+      "localhost:8888": 73728,
+      "127.0.0.1:8888": 73728,
+    },
     minRemainingTokensBeforeCompact: 20000,
     pollIntervalMs: 5000,
     cooldownMs: 2 * 60 * 1000,
@@ -30,7 +37,6 @@
     verifyTimeoutMs: 60000,
     verifyPollIntervalMs: 3000,
     verifyMinReductionTokens: 1000,
-    showCompactIndicator: true,
     dryRun: false,
     debug: false,
   };
@@ -81,6 +87,58 @@
       if (Number.isFinite(number)) return number;
     }
     return null;
+  }
+
+  function firstNonEmptyString(...values) {
+    for (const value of values) {
+      if (typeof value !== "string" && typeof value !== "number") continue;
+      const text = String(value).trim();
+      if (text) return text;
+    }
+    return null;
+  }
+
+  function extractUsageMetadata(...values) {
+    const metadata = {};
+
+    for (const value of values) {
+      if (!value || typeof value !== "object") continue;
+      const modelObject =
+        value.model && typeof value.model === "object" ? value.model :
+        value.currentModel && typeof value.currentModel === "object" ? value.currentModel :
+        value.selectedModel && typeof value.selectedModel === "object" ? value.selectedModel :
+        null;
+
+      metadata.provider ||= firstNonEmptyString(
+        value.provider,
+        value.providerName,
+        value.provider_name,
+        value.modelProvider,
+        value.model_provider,
+        value.vendor,
+        modelObject && (modelObject.provider || modelObject.providerName || modelObject.provider_name),
+      );
+      metadata.model ||= firstNonEmptyString(
+        typeof value.model === "object" ? null : value.model,
+        value.modelName,
+        value.model_name,
+        value.modelId,
+        value.model_id,
+        value.slug,
+        modelObject && (modelObject.name || modelObject.id || modelObject.slug || modelObject.model),
+      );
+      metadata.baseUrl ||= firstNonEmptyString(
+        value.baseUrl,
+        value.base_url,
+        value.apiBase,
+        value.api_base,
+        value.endpoint,
+        value.url,
+        modelObject && (modelObject.baseUrl || modelObject.base_url || modelObject.endpoint),
+      );
+    }
+
+    return Object.keys(metadata).length ? metadata : null;
   }
 
   function normalizeConversationId(value) {
@@ -285,7 +343,7 @@
     };
   }
 
-  function buildExactContextUsage(info) {
+  function buildExactContextUsage(info, ...metadataSources) {
     const parsed = parseContextUsageShape(info);
     if (!parsed) return null;
     const contextWindow = Number(parsed.modelContextWindow);
@@ -293,19 +351,46 @@
     const remainingTokens = Math.max(contextWindow - usedTokens, 0);
     const percent = (usedTokens / contextWindow) * 100;
     if (!Number.isFinite(percent)) return null;
-    return makeUsageReading(percent, usedTokens, contextWindow, true) || {
+    const reading = makeUsageReading(percent, usedTokens, contextWindow, true) || {
       exact: true,
       percent,
       usedTokens,
       contextWindow,
       remainingTokens,
     };
+    const metadata = extractUsageMetadata(info, ...metadataSources);
+    return metadata ? { ...reading, ...metadata } : reading;
+  }
+
+  function resolveContextWindowOverride(reading, config) {
+    const overrides = config && config.providerContextWindowOverrides;
+    const searchable = [
+      reading && reading.provider,
+      reading && reading.model,
+      reading && reading.baseUrl,
+    ].filter(Boolean).join(" ").toLowerCase();
+
+    if (overrides && typeof overrides === "object" && searchable) {
+      for (const [key, value] of Object.entries(overrides)) {
+        const overrideWindow = Number(value);
+        if (!Number.isFinite(overrideWindow) || overrideWindow <= 0) continue;
+        if (searchable.includes(String(key).toLowerCase())) return overrideWindow;
+      }
+    }
+
+    const globalOverride = Number(config && config.contextWindowOverride);
+    if (!Number.isFinite(globalOverride) || globalOverride <= 0) return null;
+
+    const providerText = String(reading && (reading.provider || reading.model || reading.baseUrl || "") || "").toLowerCase();
+    if (!providerText) return config && config.forceContextWindowOverride ? globalOverride : null;
+    if (/openai|chatgpt|gpt-|gpt_/.test(providerText)) return null;
+    return globalOverride;
   }
 
   function applyContextWindowOverride(reading, config) {
     if (!reading) return null;
 
-    const overrideWindow = Number(config && config.contextWindowOverride);
+    const overrideWindow = resolveContextWindowOverride(reading, config);
     if (!Number.isFinite(overrideWindow) || overrideWindow <= 0) return reading;
     if (!Number.isFinite(Number(reading.usedTokens))) return reading;
 
@@ -316,6 +401,9 @@
       ...adjustedReading,
       conversationId: reading.conversationId,
       source: reading.source,
+      provider: reading.provider,
+      model: reading.model,
+      baseUrl: reading.baseUrl,
       originalContextWindow: reading.contextWindow,
     };
   }
@@ -332,27 +420,28 @@
       value.event === "thread/tokenUsage/updated"
     ) {
       const paramsReading =
-        buildExactContextUsage(value.params && value.params.tokenUsage) ||
-        buildExactContextUsage(value.params);
+        buildExactContextUsage(value.params && value.params.tokenUsage, value.params, value) ||
+        buildExactContextUsage(value.params, value);
       if (paramsReading) return paramsReading;
     }
 
     if (value.type === "token_count" || value.event === "token_count") {
-      const infoReading = buildExactContextUsage(value.info);
+      const infoReading = buildExactContextUsage(value.info, value);
       if (infoReading) return infoReading;
     }
 
     if (value.payload && (value.payload.type === "token_count" || value.payload.event === "token_count")) {
-      const payloadReading = buildExactContextUsage(value.payload.info);
+      const payloadReading = buildExactContextUsage(value.payload.info, value.payload, value);
       if (payloadReading) return payloadReading;
     }
 
     const nestedReading = buildExactContextUsage(
       value.contextUsage || value.context_usage || value.tokenUsage || value.token_usage || value.usage,
+      value,
     );
     if (nestedReading) return nestedReading;
 
-    const infoReading = buildExactContextUsage(value.info);
+    const infoReading = buildExactContextUsage(value.info, value);
     if (infoReading) return infoReading;
 
     return null;
@@ -637,48 +726,9 @@
     if (readConfig().debug) console.log("[codex-native-auto-compact]", ...args);
   }
 
-  function ensureCompactIndicator() {
-    const id = "codex-native-auto-compact-indicator";
-    let indicator = document.getElementById(id);
-    if (indicator) return indicator;
-
-    indicator = document.createElement("div");
-    indicator.id = id;
-    indicator.setAttribute("role", "status");
-    indicator.setAttribute("aria-live", "polite");
-    indicator.textContent = "Auto compacting...";
-    Object.assign(indicator.style, {
-      position: "fixed",
-      right: "16px",
-      bottom: "16px",
-      zIndex: "2147483647",
-      display: "none",
-      maxWidth: "260px",
-      padding: "10px 12px",
-      borderRadius: "8px",
-      background: "rgba(17, 24, 39, 0.94)",
-      color: "#fff",
-      font: "13px/1.35 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-      boxShadow: "0 10px 30px rgba(0, 0, 0, 0.25)",
-      pointerEvents: "none",
-    });
-    document.documentElement.appendChild(indicator);
-    return indicator;
-  }
-
-  function setCompacting(compacting, detail = "") {
+  function setCompacting(compacting) {
     state.compacting = Boolean(compacting);
     state.compactingSince = compacting ? new Date().toISOString() : null;
-
-    const config = readConfig();
-    if (!config.showCompactIndicator) return;
-    const indicator = ensureCompactIndicator();
-    if (compacting) {
-      indicator.textContent = detail ? `Auto compacting... ${detail}` : "Auto compacting...";
-      indicator.style.display = "block";
-    } else {
-      indicator.style.display = "none";
-    }
   }
 
   function visible(element) {
@@ -710,6 +760,22 @@
       element.getAttribute("aria-disabled") === "true" ||
       element.closest("[aria-disabled='true']")
     );
+  }
+
+  function activateElement(element) {
+    if (!element) return false;
+    element.focus?.();
+    const eventOptions = { bubbles: true, cancelable: true, view: window };
+    try {
+      element.dispatchEvent(new PointerEvent("pointerdown", { ...eventOptions, pointerType: "mouse", isPrimary: true }));
+      element.dispatchEvent(new MouseEvent("mousedown", eventOptions));
+      element.dispatchEvent(new PointerEvent("pointerup", { ...eventOptions, pointerType: "mouse", isPrimary: true }));
+      element.dispatchEvent(new MouseEvent("mouseup", eventOptions));
+      element.dispatchEvent(new MouseEvent("click", eventOptions));
+    } catch (_) {
+      element.click?.();
+    }
+    return true;
   }
 
   function editableText(element) {
@@ -793,7 +859,7 @@
     const deadline = Date.now() + (Number.isFinite(timeoutMs) ? timeoutMs : 4000);
 
     do {
-      const command = findCompressCommand();
+      const command = findSlashCompressCommand() || findCompressCommand();
       if (command) return command;
       await sleep(pollIntervalMs);
     } while (Date.now() < deadline);
@@ -836,13 +902,39 @@
   }
 
   function findCompressCommand() {
-    return clickableCandidates().find((element) => {
+    const candidates = Array.from(document.querySelectorAll("button, [role='button'], [role='menuitem'], [role='option'], [cmdk-item], [data-command], a"))
+      .filter((element) => element instanceof HTMLElement && visible(element));
+
+    return candidates.find((element) => {
       if (isDisabled(element)) return false;
       const text = elementText(element);
       // Conversation titles in sidebar can contain "压缩" but are long;
       // actual compress buttons are short (typically < 30 chars).
       if (text.length > 40) return false;
       return COMPRESS_TEXT_RE.test(text);
+    }) || null;
+  }
+
+  function findSlashCompressCommand() {
+    const selectors = [
+      "button[data-list-navigation-item]",
+      "[data-list-navigation-item]",
+      "[role='option']",
+      "[role='menuitem']",
+      "[cmdk-item]",
+    ].join(", ");
+
+    return Array.from(document.querySelectorAll(selectors)).find((element) => {
+      if (!(element instanceof HTMLElement) || !visible(element) || isDisabled(element)) return false;
+      const text = elementText(element);
+      if (!text || text.length > 180) return false;
+
+      const compactText = text.replace(/\s+/g, "");
+      return (
+        /压缩此(?:对话|会话)的上下文/.test(compactText) ||
+        /^压缩/.test(compactText) ||
+        /compact(?:thisconversation|context)|compress(?:thisconversation|context)/i.test(compactText)
+      );
     }) || null;
   }
 
@@ -1009,45 +1101,53 @@
     };
   }
 
+  async function clickSlashCompact(config, reason) {
+    const slashMenu = config.dryRun ? { ok: false, code: "dry-run" } : await openSlashCommandMenu(config);
+    if (!slashMenu.ok) return { ok: false, route: "no-trigger", reason, slashMenu: { ok: false, code: slashMenu.code } };
+
+    const slashCommand = await waitForCompressCommand(config);
+    if (!slashCommand) {
+      slashMenu.cleanup?.();
+      return { ok: false, route: "slash-menu-no-command", reason, slashMenu: { ok: false, code: "no-command" } };
+    }
+
+    activateElement(slashCommand);
+    await sleep(Number(config.confirmDelayMs));
+    const confirmButton = findConfirmButton();
+    if (confirmButton) activateElement(confirmButton);
+    slashMenu.cleanup?.();
+    return { ok: true, route: "slash-command", reason };
+  }
+
   async function clickNativeCompact(config, reason) {
+    const slashResult = await clickSlashCompact(config, reason);
+    if (slashResult.ok) return slashResult;
+    if (slashResult.route === "slash-menu-no-command") return slashResult;
+
     const directCommand = findCompressCommand();
     if (directCommand) {
-      if (!config.dryRun) directCommand.click();
+      if (!config.dryRun) activateElement(directCommand);
       await sleep(Number(config.confirmDelayMs));
       const confirmButton = findConfirmButton();
-      if (confirmButton && !config.dryRun) confirmButton.click();
+      if (confirmButton && !config.dryRun) activateElement(confirmButton);
       return { ok: true, route: "direct-command", reason };
     }
 
     const trigger = findContextMenuTrigger();
     if (!trigger) {
-      const slashMenu = config.dryRun ? { ok: false, code: "dry-run" } : await openSlashCommandMenu(config);
-      if (!slashMenu.ok) return { ok: false, route: "no-trigger", reason, slashMenu: { ok: false, code: slashMenu.code } };
-
-      const slashCommand = await waitForCompressCommand(config);
-      if (!slashCommand) {
-        slashMenu.cleanup?.();
-        return { ok: false, route: "slash-menu-no-command", reason, slashMenu: { ok: false, code: "no-command" } };
-      }
-
-      slashCommand.click();
-      await sleep(Number(config.confirmDelayMs));
-      const confirmButton = findConfirmButton();
-      if (confirmButton) confirmButton.click();
-      slashMenu.cleanup?.();
-      return { ok: true, route: "slash-command", reason };
+      return clickSlashCompact(config, reason);
     }
 
-    if (!config.dryRun) trigger.click();
+    if (!config.dryRun) activateElement(trigger);
     await sleep(Number(config.menuOpenDelayMs));
 
     const menuCommand = findCompressCommand();
     if (!menuCommand) return { ok: false, route: "opened-menu-no-command", reason };
 
-    if (!config.dryRun) menuCommand.click();
+    if (!config.dryRun) activateElement(menuCommand);
     await sleep(Number(config.confirmDelayMs));
     const confirmButton = findConfirmButton();
-    if (confirmButton && !config.dryRun) confirmButton.click();
+    if (confirmButton && !config.dryRun) activateElement(confirmButton);
     return { ok: true, route: "opened-menu-command", reason };
   }
 
@@ -1068,7 +1168,7 @@
       }
 
       setCompacting(true, `${Math.round(Number(reading.percent))}%`);
-      const result = await clickNativeCompact(config, {
+      let result = await clickNativeCompact(config, {
         conversationId,
         percent: reading.percent,
         threshold: Number(config.thresholdUsedPercent),
@@ -1083,8 +1183,40 @@
         state.lastAttemptByConversationId.set(conversationId, Date.now());
         state.lastMissingTriggerByConversationId.delete(conversationId);
       }
-      const verification = result.ok ? await verifyCompactResult(reading, config) : null;
-      state.lastAction = { at: new Date().toISOString(), ...result, verification };
+      let verification = result.ok ? await verifyCompactResult(reading, config) : null;
+      let fallback = null;
+
+      if (
+        result.ok &&
+        verification &&
+        !verification.ok &&
+        result.route !== "slash-command" &&
+        !config.dryRun
+      ) {
+        const fallbackReason = { ...result.reason, fallbackFrom: result.route, fallbackCode: verification.code };
+        setCompacting(true, "retrying /");
+        fallback = await clickSlashCompact(config, fallbackReason);
+        fallback.verification = fallback.ok
+          ? await verifyCompactResult(verification.after || reading, config)
+          : null;
+
+        if (fallback.route === "no-trigger" || fallback.route === "slash-menu-no-command") {
+          state.lastMissingTriggerByConversationId.set(conversationId, Date.now());
+        } else {
+          state.lastAttemptByConversationId.set(conversationId, Date.now());
+          state.lastMissingTriggerByConversationId.delete(conversationId);
+        }
+
+        if (fallback.ok && fallback.verification && fallback.verification.ok) {
+          result = {
+            ...fallback,
+            primary: { ...result, verification },
+          };
+          verification = fallback.verification;
+        }
+      }
+
+      state.lastAction = { at: new Date().toISOString(), ...result, verification, fallback };
       log("attempt", state.lastAction);
       return state.lastAction;
     } finally {
@@ -1102,12 +1234,13 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.3.5",
+    version: "0.4.0",
     start,
     tick,
     readConfig,
     readUsage: getContextUsage,
     findCompressCommand,
+    findSlashCompressCommand,
     findContextMenuTrigger,
     findComposerInput,
     getState() {
@@ -1124,7 +1257,6 @@
     destroy() {
       state.destroyed = true;
       setCompacting(false);
-      document.getElementById("codex-native-auto-compact-indicator")?.remove();
       window.clearInterval(state.timer);
       delete window[API_KEY];
     },
