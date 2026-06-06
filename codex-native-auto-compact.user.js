@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.3.3
+// @version      0.3.4
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -20,6 +20,8 @@
     cooldownMs: 2 * 60 * 1000,
     missingTriggerRetryMs: 10 * 1000,
     slashMenuOpenDelayMs: 650,
+    slashMenuCommandTimeoutMs: 4000,
+    slashMenuCommandPollIntervalMs: 250,
     menuOpenDelayMs: 650,
     confirmDelayMs: 650,
     onlyWhenIdle: true,
@@ -718,21 +720,34 @@
   }
 
   function setEditableText(element, value) {
-    element.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: value, code: value === "/" ? "Slash" : undefined }));
+    const key = value === "/" ? "/" : value;
+    const code = value === "/" ? "Slash" : undefined;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key, code }));
+    element.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: value }));
+
+    const selection = window.getSelection?.();
+    let usedExecCommand = false;
+    if (element.isContentEditable && selection) {
+      selection.selectAllChildren(element);
+      selection.collapseToEnd();
+      usedExecCommand = document.execCommand?.("insertText", false, value) === true;
+    }
+
     if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
       const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
       if (setter) setter.call(element, value);
       else element.value = value;
       element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
-      element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: value, code: value === "/" ? "Slash" : undefined }));
+      element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key, code }));
       return true;
     }
 
     if (element?.isContentEditable) {
-      element.textContent = value;
+      if (!usedExecCommand) element.textContent = value;
       element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
-      element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: value, code: value === "/" ? "Slash" : undefined }));
+      element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key, code }));
       return true;
     }
 
@@ -770,6 +785,20 @@
         if (editableText(input) === "/") setEditableText(input, "");
       },
     };
+  }
+
+  async function waitForCompressCommand(config) {
+    const timeoutMs = Number(config.slashMenuCommandTimeoutMs);
+    const pollIntervalMs = Math.max(50, Number(config.slashMenuCommandPollIntervalMs) || 250);
+    const deadline = Date.now() + (Number.isFinite(timeoutMs) ? timeoutMs : 4000);
+
+    do {
+      const command = findCompressCommand();
+      if (command) return command;
+      await sleep(pollIntervalMs);
+    } while (Date.now() < deadline);
+
+    return null;
   }
 
   function shortControlText(element) {
@@ -991,7 +1020,7 @@
       const slashMenu = config.dryRun ? { ok: false, code: "dry-run" } : await openSlashCommandMenu(config);
       if (!slashMenu.ok) return { ok: false, route: "no-trigger", reason, slashMenu: { ok: false, code: slashMenu.code } };
 
-      const slashCommand = findCompressCommand();
+      const slashCommand = await waitForCompressCommand(config);
       if (!slashCommand) {
         slashMenu.cleanup?.();
         return { ok: false, route: "slash-menu-no-command", reason, slashMenu: { ok: false, code: "no-command" } };
@@ -1069,7 +1098,7 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.3.3",
+    version: "0.3.4",
     start,
     tick,
     readConfig,

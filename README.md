@@ -40,6 +40,8 @@ localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
   cooldownMs: 120000,           // Cooldown between compressions per conversation (ms)
   missingTriggerRetryMs: 10000, // Short retry delay when the compact UI trigger is temporarily hidden
   slashMenuOpenDelayMs: 650,    // Delay after typing "/" to open the command menu (ms)
+  slashMenuCommandTimeoutMs: 4000, // Maximum time to wait for the slash compact command (ms)
+  slashMenuCommandPollIntervalMs: 250, // Poll interval while waiting for slash menu command (ms)
   menuOpenDelayMs: 650,         // Delay after opening context menu (ms)
   confirmDelayMs: 650,          // Delay after clicking compress (ms)
   onlyWhenIdle: true,           // Avoid compacting while Codex is generating or reconnecting
