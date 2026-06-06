@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.3.1
+// @version      0.3.2
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -18,6 +18,7 @@
     minRemainingTokensBeforeCompact: 20000,
     pollIntervalMs: 5000,
     cooldownMs: 2 * 60 * 1000,
+    missingTriggerRetryMs: 10 * 1000,
     menuOpenDelayMs: 650,
     confirmDelayMs: 650,
     onlyWhenIdle: true,
@@ -46,6 +47,7 @@
     compacting: false,
     compactingSince: null,
     lastAttemptByConversationId: new Map(),
+    lastMissingTriggerByConversationId: new Map(),
     lastAction: null,
     lastSkip: null,
   };
@@ -63,6 +65,7 @@
   const COMPRESS_TEXT_RE = /压缩此对话的上下文|压缩上下文|压缩对话|compress this conversation|compact this conversation|compact context|compress context/i;
   const CONFIRM_TEXT_RE = /^(压缩|确认|继续|compress|compact|confirm|continue)$/i;
   const CONTEXT_TEXT_RE = /context|token|tokens|usage|window|budget|remaining|上下文|令牌|使用|窗口|压缩/i;
+  const MENU_TRIGGER_TEXT_RE = /more|options|menu|open menu|ellipsis|更多|选项|菜单|操作|⋯|…/i;
   const SEND_TEXT_RE = /send|发送|submit|提交/i;
 
   // ========================
@@ -694,7 +697,7 @@
   }
 
   function clickableCandidates() {
-    return Array.from(document.querySelectorAll("button, [role='button'], [cmdk-item], [data-command], li, div"))
+    return Array.from(document.querySelectorAll("button, [role='button'], [role='menuitem'], [role='option'], [cmdk-item], [data-command], a, li, div"))
       .filter((element) => element instanceof HTMLElement && visible(element));
   }
 
@@ -742,9 +745,40 @@
       const text = elementText(element);
       // Conversation titles in sidebar can contain "压缩" but are long;
       // actual compress buttons are short (typically < 30 chars).
-      if (text.length > 30) return false;
+      if (text.length > 40) return false;
       return COMPRESS_TEXT_RE.test(text);
     }) || null;
+  }
+
+  function hasContextTextNearby(element) {
+    let current = element;
+    for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+      const text = elementText(current);
+      if (!text || text.length > 1000) continue;
+      if (SEND_TEXT_RE.test(text)) continue;
+      if (CONTEXT_TEXT_RE.test(text)) return true;
+    }
+    return false;
+  }
+
+  function looksLikeMenuTrigger(element) {
+    const text = elementText(element);
+    if (SEND_TEXT_RE.test(text)) return false;
+    if (text.length > 80) return false;
+    if (MENU_TRIGGER_TEXT_RE.test(text)) return true;
+    if (element.getAttribute("aria-haspopup")) return true;
+    if (element.getAttribute("data-state") === "closed" && element.querySelector("svg")) return true;
+    return text.length === 0 && Boolean(element.querySelector("svg"));
+  }
+
+  function scoreContextMenuTrigger(element) {
+    const text = elementText(element);
+    if (SEND_TEXT_RE.test(text)) return null;
+    if (text.length > 80) return null;
+    if (COMPRESS_TEXT_RE.test(text)) return 0;
+    if (CONTEXT_TEXT_RE.test(text) && text.length <= 40) return text.includes("%") ? 1 : 2;
+    if (looksLikeMenuTrigger(element) && hasContextTextNearby(element)) return 3;
+    return null;
   }
 
 
@@ -752,23 +786,16 @@
     const buttons = Array.from(document.querySelectorAll("button, [role='button']"))
       .filter((element) => element instanceof HTMLElement && visible(element) && !isDisabled(element));
 
-    const candidates = buttons.filter((button) => {
-      const text = elementText(button);
-      if (!CONTEXT_TEXT_RE.test(text)) return false;
-      if (SEND_TEXT_RE.test(text)) return false;
-      if (text.length > 30) return false;
-      return true;
-    });
+    const candidates = buttons
+      .map((button) => ({ button, score: scoreContextMenuTrigger(button) }))
+      .filter((candidate) => candidate.score != null);
 
     candidates.sort((a, b) => {
-      const at = elementText(a);
-      const bt = elementText(b);
-      const as = COMPRESS_TEXT_RE.test(at) ? 0 : at.includes("%") ? 1 : 2;
-      const bs = COMPRESS_TEXT_RE.test(bt) ? 0 : bt.includes("%") ? 1 : 2;
-      return as - bs;
+      if (a.score !== b.score) return a.score - b.score;
+      return elementText(a.button).length - elementText(b.button).length;
     });
 
-    return candidates[0] || null;
+    return candidates[0]?.button || null;
   }
 
   function findConfirmButton() {
@@ -814,6 +841,18 @@
     const elapsedMs = Date.now() - lastAttemptAt;
     if (Number.isFinite(cooldownMs) && elapsedMs < cooldownMs) {
       return { ok: false, code: "cooldown", elapsedMs, cooldownMs };
+    }
+
+    const lastMissingTriggerAt = state.lastMissingTriggerByConversationId.get(conversationId) || 0;
+    const missingTriggerRetryMs = Number(config.missingTriggerRetryMs);
+    const missingTriggerElapsedMs = Date.now() - lastMissingTriggerAt;
+    if (Number.isFinite(missingTriggerRetryMs) && missingTriggerElapsedMs < missingTriggerRetryMs) {
+      return {
+        ok: false,
+        code: "missing-trigger-retry",
+        elapsedMs: missingTriggerElapsedMs,
+        retryMs: missingTriggerRetryMs,
+      };
     }
 
     if (config.onlyWhenIdle) {
@@ -916,7 +955,6 @@
         return null;
       }
 
-      state.lastAttemptByConversationId.set(conversationId, Date.now());
       setCompacting(true, `${Math.round(Number(reading.percent))}%`);
       const result = await clickNativeCompact(config, {
         conversationId,
@@ -927,6 +965,12 @@
         trigger: decision.code,
         source: reading.exact ? "react-graph" : "approximate",
       });
+      if (result.route === "no-trigger" || result.route === "opened-menu-no-command") {
+        state.lastMissingTriggerByConversationId.set(conversationId, Date.now());
+      } else {
+        state.lastAttemptByConversationId.set(conversationId, Date.now());
+        state.lastMissingTriggerByConversationId.delete(conversationId);
+      }
       const verification = result.ok ? await verifyCompactResult(reading, config) : null;
       state.lastAction = { at: new Date().toISOString(), ...result, verification };
       log("attempt", state.lastAction);
@@ -946,7 +990,7 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.3.1",
+    version: "0.3.2",
     start,
     tick,
     readConfig,
@@ -961,6 +1005,7 @@
         lastAction: state.lastAction,
         lastSkip: state.lastSkip,
         lastAttemptConversationIds: Array.from(state.lastAttemptByConversationId.keys()),
+        lastMissingTriggerConversationIds: Array.from(state.lastMissingTriggerByConversationId.keys()),
       };
     },
     destroy() {
