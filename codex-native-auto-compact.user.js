@@ -13,10 +13,10 @@
   const API_KEY = "__codexNativeAutoCompact";
   const CONFIG_STORAGE_KEY = "codexNativeAutoCompactConfig";
   const DEFAULT_CONFIG = {
-    thresholdUsedPercent: 82,
+    thresholdUsedPercent: 68,
     contextWindowOverride: 73728,
     pollIntervalMs: 5000,
-    cooldownMs: 10 * 60 * 1000,
+    cooldownMs: 2 * 60 * 1000,
     menuOpenDelayMs: 650,
     confirmDelayMs: 650,
     dryRun: false,

@@ -33,10 +33,10 @@ Configuration is stored in `localStorage` under the key `codexNativeAutoCompactC
 
 ```javascript
 localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
-  thresholdUsedPercent: 82,    // Compress when usage exceeds this percentage
+  thresholdUsedPercent: 68,    // Compress early enough to leave room for the compact request
   contextWindowOverride: 73728, // Use llama-server -c / --ctx-size instead of Codex UI model_context_window
   pollIntervalMs: 5000,         // How often to check context usage (ms)
-  cooldownMs: 600000,           // Cooldown between compressions per conversation (ms)
+  cooldownMs: 120000,           // Cooldown between compressions per conversation (ms)
   menuOpenDelayMs: 650,         // Delay after opening context menu (ms)
   confirmDelayMs: 650,          // Delay after clicking compress (ms)
   dryRun: false,                // If true, don't actually compress (for testing)
@@ -45,6 +45,8 @@ localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
 ```
 
 Set `contextWindowOverride` to `0` or `null` to trust the context window reported by Codex. For a local `llama-server -c 73728`, keep it at `73728`; this prevents Codex Desktop metadata such as `258400` from making the used percentage look too low.
+
+With a `73728` context window, keep `thresholdUsedPercent` around `65`-`70`. Native compact still has to send the current conversation plus system/tool wrapper tokens, so waiting until `82%` can leave too little room and make the compact request itself exceed the server context.
 
 ## How It Works
 
