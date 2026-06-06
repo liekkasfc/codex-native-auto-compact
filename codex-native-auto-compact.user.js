@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.3.4
+// @version      0.3.5
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -801,32 +801,36 @@
     return null;
   }
 
-  function shortControlText(element) {
+  function shortControlText(element, maxLength = 80) {
     const text = elementText(element);
-    return text.length <= 80 ? text : "";
+    return text.length <= maxLength ? text : "";
+  }
+
+  function isButtonLike(element) {
+    return element.matches?.("button, [role='button']") || element.closest?.("button, [role='button']");
   }
 
   function findBusyIndicator() {
-    const busyControlRe = /stop generating|stop response|cancel response|停止生成|停止回答|停止|中止|取消生成/i;
-    const controls = Array.from(document.querySelectorAll("button, [role='button'], [aria-label], [title]"))
-      .filter((element) => element instanceof HTMLElement && visible(element) && !isDisabled(element));
+    const busyControlRe = /^(stop generating|stop response|cancel response|停止生成|停止回答|中止生成|取消生成|取消回答)$/i;
+    const controls = Array.from(document.querySelectorAll("button, [role='button']"))
+      .filter((element) => element instanceof HTMLElement && visible(element) && !isDisabled(element) && isButtonLike(element));
 
     const busyControl = controls.find((element) => {
-      const label = shortControlText(element);
+      const label = shortControlText(element, 48);
       if (!label) return false;
       if (SEND_TEXT_RE.test(label)) return false;
       return busyControlRe.test(label);
     });
-    if (busyControl) return { type: "control", text: shortControlText(busyControl) };
+    if (busyControl) return { type: "control", text: shortControlText(busyControl, 48) };
 
     const statusRe = /reconnecting|generating|thinking|正在重新连接|正在生成|思考中|生成中/i;
     const statuses = Array.from(document.querySelectorAll("[role='status'], [aria-live]"))
       .filter((element) => element instanceof HTMLElement && visible(element));
     const busyStatus = statuses.find((element) => {
-      const text = shortControlText(element);
+      const text = shortControlText(element, 64);
       return text && statusRe.test(text);
     });
-    if (busyStatus) return { type: "status", text: shortControlText(busyStatus) };
+    if (busyStatus) return { type: "status", text: shortControlText(busyStatus, 64) };
 
     return null;
   }
@@ -1098,7 +1102,7 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.3.4",
+    version: "0.3.5",
     start,
     tick,
     readConfig,
