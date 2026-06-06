@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.2.2
+// @version      0.3.0
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -15,10 +15,17 @@
   const DEFAULT_CONFIG = {
     thresholdUsedPercent: 68,
     contextWindowOverride: 73728,
+    minRemainingTokensBeforeCompact: 20000,
     pollIntervalMs: 5000,
     cooldownMs: 2 * 60 * 1000,
     menuOpenDelayMs: 650,
     confirmDelayMs: 650,
+    onlyWhenIdle: true,
+    verifyAfterCompact: true,
+    verifyDelayMs: 8000,
+    verifyTimeoutMs: 60000,
+    verifyPollIntervalMs: 3000,
+    verifyMinReductionTokens: 1000,
     dryRun: false,
     debug: false,
   };
@@ -37,6 +44,7 @@
     running: false,
     lastAttemptByConversationId: new Map(),
     lastAction: null,
+    lastSkip: null,
   };
 
   // Context Ring Restore state
@@ -651,6 +659,36 @@
     );
   }
 
+  function shortControlText(element) {
+    const text = elementText(element);
+    return text.length <= 80 ? text : "";
+  }
+
+  function findBusyIndicator() {
+    const busyControlRe = /stop generating|stop response|cancel response|停止生成|停止回答|停止|中止|取消生成/i;
+    const controls = Array.from(document.querySelectorAll("button, [role='button'], [aria-label], [title]"))
+      .filter((element) => element instanceof HTMLElement && visible(element) && !isDisabled(element));
+
+    const busyControl = controls.find((element) => {
+      const label = shortControlText(element);
+      if (!label) return false;
+      if (SEND_TEXT_RE.test(label)) return false;
+      return busyControlRe.test(label);
+    });
+    if (busyControl) return { type: "control", text: shortControlText(busyControl) };
+
+    const statusRe = /reconnecting|generating|thinking|正在重新连接|正在生成|思考中|生成中/i;
+    const statuses = Array.from(document.querySelectorAll("[role='status'], [aria-live]"))
+      .filter((element) => element instanceof HTMLElement && visible(element));
+    const busyStatus = statuses.find((element) => {
+      const text = shortControlText(element);
+      return text && statusRe.test(text);
+    });
+    if (busyStatus) return { type: "status", text: shortControlText(busyStatus) };
+
+    return null;
+  }
+
   function findCompressCommand() {
     return clickableCandidates().find((element) => {
       if (isDisabled(element)) return false;
@@ -697,12 +735,96 @@
     return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
-  function shouldAttempt(reading, config, conversationId) {
-    if (!reading || !Number.isFinite(Number(reading.percent))) return false;
-    if (Number(reading.percent) < Number(config.thresholdUsedPercent)) return false;
+  function getAttemptDecision(reading, config, conversationId) {
+    if (!reading || !Number.isFinite(Number(reading.percent))) {
+      return { ok: false, code: "no-usage" };
+    }
+
+    const percent = Number(reading.percent);
+    const threshold = Number(config.thresholdUsedPercent);
+    const remainingTokens = Number(reading.remainingTokens);
+    const minRemainingTokens = Number(config.minRemainingTokensBeforeCompact);
+    const hitPercentThreshold = Number.isFinite(threshold) && percent >= threshold;
+    const hitRemainingThreshold =
+      Number.isFinite(remainingTokens) &&
+      Number.isFinite(minRemainingTokens) &&
+      minRemainingTokens > 0 &&
+      remainingTokens <= minRemainingTokens;
+
+    if (!hitPercentThreshold && !hitRemainingThreshold) {
+      return {
+        ok: false,
+        code: "below-threshold",
+        percent,
+        threshold,
+        remainingTokens: Number.isFinite(remainingTokens) ? remainingTokens : null,
+        minRemainingTokens: Number.isFinite(minRemainingTokens) ? minRemainingTokens : null,
+      };
+    }
 
     const lastAttemptAt = state.lastAttemptByConversationId.get(conversationId) || 0;
-    return Date.now() - lastAttemptAt >= Number(config.cooldownMs);
+    const cooldownMs = Number(config.cooldownMs);
+    const elapsedMs = Date.now() - lastAttemptAt;
+    if (Number.isFinite(cooldownMs) && elapsedMs < cooldownMs) {
+      return { ok: false, code: "cooldown", elapsedMs, cooldownMs };
+    }
+
+    if (config.onlyWhenIdle) {
+      const busyIndicator = findBusyIndicator();
+      if (busyIndicator) {
+        return { ok: false, code: "busy", busyIndicator };
+      }
+    }
+
+    return {
+      ok: true,
+      code: hitPercentThreshold ? "percent-threshold" : "remaining-threshold",
+      percent,
+      threshold,
+      remainingTokens: Number.isFinite(remainingTokens) ? remainingTokens : null,
+      minRemainingTokens: Number.isFinite(minRemainingTokens) ? minRemainingTokens : null,
+    };
+  }
+
+  async function verifyCompactResult(beforeReading, config) {
+    if (!config.verifyAfterCompact || config.dryRun) return null;
+    await sleep(Math.max(0, Number(config.verifyDelayMs) || 0));
+
+    const beforeUsedTokens = Number(beforeReading && beforeReading.usedTokens);
+    const minReduction = Math.max(0, Number(config.verifyMinReductionTokens) || 0);
+    const timeoutMs = Math.max(0, Number(config.verifyTimeoutMs) || 0);
+    const pollIntervalMs = Math.max(500, Number(config.verifyPollIntervalMs) || 3000);
+    const deadline = Date.now() + timeoutMs;
+    let afterReading = null;
+    let reductionTokens = null;
+    let ok = false;
+
+    do {
+      cachedContextUsage = { at: 0, value: null };
+      afterReading = getContextUsage();
+      const afterUsedTokens = Number(afterReading && afterReading.usedTokens);
+      reductionTokens =
+        Number.isFinite(beforeUsedTokens) && Number.isFinite(afterUsedTokens)
+          ? beforeUsedTokens - afterUsedTokens
+          : null;
+
+      ok =
+        reductionTokens == null
+          ? Number(afterReading && afterReading.percent) < Number(beforeReading && beforeReading.percent)
+          : reductionTokens >= minReduction;
+
+      if (ok || Date.now() >= deadline) break;
+      await sleep(pollIntervalMs);
+    } while (true);
+
+    return {
+      ok,
+      code: ok ? "usage-reduced" : "usage-not-reduced",
+      before: beforeReading,
+      after: afterReading,
+      reductionTokens,
+      minReductionTokens: minReduction,
+    };
   }
 
   async function clickNativeCompact(config, reason) {
@@ -738,16 +860,27 @@
       const config = readConfig();
       const reading = getContextUsage();
       const conversationId = String(reading?.conversationId || readActiveConversationId() || "__unknown__");
-      if (!shouldAttempt(reading, config, conversationId)) return null;
+      const decision = getAttemptDecision(reading, config, conversationId);
+      if (!decision.ok) {
+        if (decision.code !== "below-threshold") {
+          state.lastSkip = { at: new Date().toISOString(), conversationId, ...decision };
+          log("skip", state.lastSkip);
+        }
+        return null;
+      }
 
       state.lastAttemptByConversationId.set(conversationId, Date.now());
       const result = await clickNativeCompact(config, {
         conversationId,
         percent: reading.percent,
         threshold: Number(config.thresholdUsedPercent),
+        remainingTokens: reading.remainingTokens,
+        minRemainingTokens: Number(config.minRemainingTokensBeforeCompact),
+        trigger: decision.code,
         source: reading.exact ? "react-graph" : "approximate",
       });
-      state.lastAction = { at: new Date().toISOString(), ...result };
+      const verification = result.ok ? await verifyCompactResult(reading, config) : null;
+      state.lastAction = { at: new Date().toISOString(), ...result, verification };
       log("attempt", state.lastAction);
       return state.lastAction;
     } finally {
@@ -764,7 +897,7 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.2.2",
+    version: "0.3.0",
     start,
     tick,
     readConfig,
@@ -775,6 +908,7 @@
       return {
         running: state.running,
         lastAction: state.lastAction,
+        lastSkip: state.lastSkip,
         lastAttemptConversationIds: Array.from(state.lastAttemptByConversationId.keys()),
       };
     },
