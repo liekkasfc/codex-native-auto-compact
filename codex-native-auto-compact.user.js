@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.2.1
+// @version      0.2.2
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -764,7 +764,7 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.2.1",
+    version: "0.2.2",
     start,
     tick,
     readConfig,
