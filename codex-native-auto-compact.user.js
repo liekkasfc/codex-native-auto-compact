@@ -654,9 +654,14 @@
   function findCompressCommand() {
     return clickableCandidates().find((element) => {
       if (isDisabled(element)) return false;
-      return COMPRESS_TEXT_RE.test(elementText(element));
+      const text = elementText(element);
+      // Conversation titles in sidebar can contain "压缩" but are long;
+      // actual compress buttons are short (typically < 30 chars).
+      if (text.length > 30) return false;
+      return COMPRESS_TEXT_RE.test(text);
     }) || null;
   }
+
 
   function findContextMenuTrigger() {
     const buttons = Array.from(document.querySelectorAll("button, [role='button']"))
@@ -666,6 +671,7 @@
       const text = elementText(button);
       if (!CONTEXT_TEXT_RE.test(text)) return false;
       if (SEND_TEXT_RE.test(text)) return false;
+      if (text.length > 30) return false;
       return true;
     });
 
