@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.4.0
+// @version      0.4.1
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -16,12 +16,16 @@
     thresholdUsedPercent: 68,
     contextWindowOverride: null,
     forceContextWindowOverride: false,
+    modelContextWindowOverrides: {},
     providerContextWindowOverrides: {
       "llama.cpp": 73728,
       llamacpp: 73728,
       "localhost:8888": 73728,
       "127.0.0.1:8888": 73728,
     },
+    autoDiscoverContextWindow: true,
+    contextWindowDiscoveryTimeoutMs: 1500,
+    contextWindowDiscoveryTtlMs: 10 * 60 * 1000,
     minRemainingTokensBeforeCompact: 20000,
     pollIntervalMs: 5000,
     cooldownMs: 2 * 60 * 1000,
@@ -65,6 +69,8 @@
   let cachedContextUsage = { at: 0, value: null };
   const officialMenuUsageByConversationId = new Map();
   const capturedUsageByConversationId = new Map();
+  const discoveredContextWindowByKey = new Map();
+  const pendingContextWindowDiscoveryByKey = new Map();
   let captureInstalled = false;
 
   // Prevent double installation
@@ -98,6 +104,17 @@
     return null;
   }
 
+  function firstFiniteContextWindow(...values) {
+    for (const value of values) {
+      const number = Number(value);
+      if (!Number.isFinite(number) || number <= 0) continue;
+      // Avoid confusing a response/output token cap with a model context window.
+      if (number < 1024) continue;
+      return number;
+    }
+    return null;
+  }
+
   function extractUsageMetadata(...values) {
     const metadata = {};
 
@@ -116,6 +133,9 @@
         value.modelProvider,
         value.model_provider,
         value.vendor,
+        value.vendorName,
+        value.provider_id,
+        value.providerId,
         modelObject && (modelObject.provider || modelObject.providerName || modelObject.provider_name),
       );
       metadata.model ||= firstNonEmptyString(
@@ -130,8 +150,13 @@
       metadata.baseUrl ||= firstNonEmptyString(
         value.baseUrl,
         value.base_url,
+        value.apiBaseUrl,
+        value.api_base_url,
         value.apiBase,
         value.api_base,
+        value.serverUrl,
+        value.server_url,
+        value.host,
         value.endpoint,
         value.url,
         modelObject && (modelObject.baseUrl || modelObject.base_url || modelObject.endpoint),
@@ -307,11 +332,29 @@
   function parseContextUsageShape(value) {
     if (!value || typeof value !== "object") return null;
 
-    const modelContextWindow = firstFiniteNumber(
+    const modelContextWindow = firstFiniteContextWindow(
       value.model_context_window,
       value.modelContextWindow,
       value.context_window,
       value.contextWindow,
+      value.context_length,
+      value.contextLength,
+      value.max_context_length,
+      value.maxContextLength,
+      value.max_model_len,
+      value.maxModelLen,
+      value.max_sequence_length,
+      value.maxSequenceLength,
+      value.max_input_tokens,
+      value.maxInputTokens,
+      value.input_token_limit,
+      value.inputTokenLimit,
+      value.token_limit,
+      value.tokenLimit,
+      value.n_ctx,
+      value.nCtx,
+      value.num_ctx,
+      value.numCtx,
       value.window_tokens,
       value.windowTokens,
     );
@@ -362,21 +405,155 @@
     return metadata ? { ...reading, ...metadata } : reading;
   }
 
+  function findContextWindowOverride(overrides, searchable) {
+    if (overrides && typeof overrides === "object" && searchable) {
+      for (const [key, value] of Object.entries(overrides)) {
+        const overrideWindow = Number(value);
+        if (!Number.isFinite(overrideWindow) || overrideWindow <= 0) continue;
+        const keyText = String(key).trim();
+        if (!keyText) continue;
+        if (keyText.startsWith("/") && keyText.endsWith("/") && keyText.length > 2) {
+          try {
+            if (new RegExp(keyText.slice(1, -1), "i").test(searchable)) return overrideWindow;
+          } catch (_) {}
+          continue;
+        }
+        if (searchable.includes(keyText.toLowerCase())) return overrideWindow;
+      }
+    }
+    return null;
+  }
+
+  function normalizeProviderBaseUrl(value) {
+    const text = firstNonEmptyString(value);
+    if (!text || !/^https?:\/\//i.test(text)) return null;
+    try {
+      const url = new URL(text);
+      url.search = "";
+      url.hash = "";
+      url.pathname = url.pathname.replace(/\/(?:v1|api\/v1|openai\/v1)\/?.*$/i, "");
+      url.pathname = url.pathname.replace(/\/+$/, "");
+      return url.toString().replace(/\/$/, "");
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function discoveryKey(reading) {
+    const baseUrl = normalizeProviderBaseUrl(reading && reading.baseUrl);
+    if (!baseUrl) return null;
+    const model = firstNonEmptyString(reading && reading.model);
+    return `${baseUrl}::${model || "*"}`;
+  }
+
+  function readContextWindowFromObject(value, modelName, depth = 0, seen = new WeakSet()) {
+    if (!value || typeof value !== "object" || depth > 5 || seen.has(value)) return null;
+    seen.add(value);
+
+    const direct = firstFiniteContextWindow(
+      value.context_length,
+      value.contextLength,
+      value.max_context_length,
+      value.maxContextLength,
+      value.max_model_len,
+      value.maxModelLen,
+      value.max_sequence_length,
+      value.maxSequenceLength,
+      value.max_input_tokens,
+      value.maxInputTokens,
+      value.input_token_limit,
+      value.inputTokenLimit,
+      value.token_limit,
+      value.tokenLimit,
+      value.n_ctx,
+      value.nCtx,
+      value.num_ctx,
+      value.numCtx,
+      value.model_context_window,
+      value.modelContextWindow,
+      value.context_window,
+      value.contextWindow,
+    );
+    if (direct) return direct;
+
+    const wantedModel = String(modelName || "").toLowerCase();
+    if (Array.isArray(value)) {
+      const matchingItems = wantedModel
+        ? value.filter((item) => {
+          const id = firstNonEmptyString(item && item.id, item && item.name, item && item.model, item && item.slug);
+          return id && id.toLowerCase() === wantedModel;
+        })
+        : value;
+      for (const item of matchingItems) {
+        const nested = readContextWindowFromObject(item, modelName, depth + 1, seen);
+        if (nested) return nested;
+      }
+      return null;
+    }
+
+    for (const key of ["data", "models", "model", "metadata", "capabilities", "props", "default_generation_settings"]) {
+      const nested = readContextWindowFromObject(value[key], modelName, depth + 1, seen);
+      if (nested) return nested;
+    }
+
+    return null;
+  }
+
+  function fetchJsonWithTimeout(url, timeoutMs) {
+    if (typeof fetch !== "function" || typeof AbortController !== "function") return Promise.resolve(null);
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), Math.max(250, Number(timeoutMs) || 1500));
+    return fetch(url, { signal: controller.signal, credentials: "omit" })
+      .then((response) => response && response.ok ? response.json() : null)
+      .catch(() => null)
+      .finally(() => window.clearTimeout(timer));
+  }
+
+  function maybeDiscoverContextWindow(reading, config) {
+    if (!config || !config.autoDiscoverContextWindow) return;
+    const baseUrl = normalizeProviderBaseUrl(reading && reading.baseUrl);
+    const key = discoveryKey(reading);
+    if (!baseUrl || !key || pendingContextWindowDiscoveryByKey.has(key)) return;
+
+    const ttlMs = Math.max(60 * 1000, Number(config.contextWindowDiscoveryTtlMs) || 10 * 60 * 1000);
+    const cached = discoveredContextWindowByKey.get(key);
+    if (cached && Date.now() - cached.at < ttlMs) return;
+
+    const timeoutMs = Number(config.contextWindowDiscoveryTimeoutMs) || 1500;
+    const model = firstNonEmptyString(reading && reading.model);
+    const urls = [`${baseUrl}/props`, `${baseUrl}/v1/models`, `${baseUrl}/models`];
+
+    const task = (async () => {
+      for (const url of urls) {
+        const payload = await fetchJsonWithTimeout(url, timeoutMs);
+        const windowSize = readContextWindowFromObject(payload, model);
+        if (windowSize) {
+          discoveredContextWindowByKey.set(key, { at: Date.now(), value: windowSize, url });
+          return;
+        }
+      }
+      discoveredContextWindowByKey.set(key, { at: Date.now(), value: null, url: null });
+    })().finally(() => pendingContextWindowDiscoveryByKey.delete(key));
+
+    pendingContextWindowDiscoveryByKey.set(key, task);
+  }
+
   function resolveContextWindowOverride(reading, config) {
-    const overrides = config && config.providerContextWindowOverrides;
     const searchable = [
       reading && reading.provider,
       reading && reading.model,
       reading && reading.baseUrl,
     ].filter(Boolean).join(" ").toLowerCase();
 
-    if (overrides && typeof overrides === "object" && searchable) {
-      for (const [key, value] of Object.entries(overrides)) {
-        const overrideWindow = Number(value);
-        if (!Number.isFinite(overrideWindow) || overrideWindow <= 0) continue;
-        if (searchable.includes(String(key).toLowerCase())) return overrideWindow;
-      }
-    }
+    const modelOverride = findContextWindowOverride(config && config.modelContextWindowOverrides, searchable);
+    if (modelOverride) return modelOverride;
+
+    const providerOverride = findContextWindowOverride(config && config.providerContextWindowOverrides, searchable);
+    if (providerOverride) return providerOverride;
+
+    maybeDiscoverContextWindow(reading, config);
+    const discovered = discoveredContextWindowByKey.get(discoveryKey(reading));
+    if (discovered && Number.isFinite(Number(discovered.value)) && Number(discovered.value) > 0) return Number(discovered.value);
 
     const globalOverride = Number(config && config.contextWindowOverride);
     if (!Number.isFinite(globalOverride) || globalOverride <= 0) return null;
@@ -1234,7 +1411,7 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.4.0",
+    version: "0.4.1",
     start,
     tick,
     readConfig,
@@ -1243,6 +1420,9 @@
     findSlashCompressCommand,
     findContextMenuTrigger,
     findComposerInput,
+    getContextWindowDiscovery() {
+      return Array.from(discoveredContextWindowByKey.entries()).map(([key, value]) => ({ key, ...value }));
+    },
     getState() {
       return {
         running: state.running,

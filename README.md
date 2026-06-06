@@ -34,7 +34,16 @@ Configuration is stored in `localStorage` under the key `codexNativeAutoCompactC
 ```javascript
 localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
   thresholdUsedPercent: 68,    // Compress early enough to leave room for the compact request
-  contextWindowOverride: 73728, // Use llama-server -c / --ctx-size instead of Codex UI model_context_window
+  contextWindowOverride: null,  // Trust Codex/provider metadata unless an override is needed
+  forceContextWindowOverride: false, // If true, apply contextWindowOverride even when provider is unknown
+  modelContextWindowOverrides: {}, // Optional model-name or /regex/ overrides
+  providerContextWindowOverrides: {
+    "llama.cpp": 73728,
+    "localhost:8888": 73728
+  },
+  autoDiscoverContextWindow: true, // Try provider endpoints like /props and /v1/models
+  contextWindowDiscoveryTimeoutMs: 1500,
+  contextWindowDiscoveryTtlMs: 600000,
   minRemainingTokensBeforeCompact: 20000, // Also compact when remaining tokens fall below this buffer
   pollIntervalMs: 5000,         // How often to check context usage (ms)
   cooldownMs: 120000,           // Cooldown between compressions per conversation (ms)
@@ -50,13 +59,14 @@ localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
   verifyTimeoutMs: 60000,       // Maximum time spent waiting for usage to drop (ms)
   verifyPollIntervalMs: 3000,   // Poll interval while verifying compaction result (ms)
   verifyMinReductionTokens: 1000, // Minimum token drop considered a successful compact
-  showCompactIndicator: true,   // Show a small bottom-right indicator while compacting
   dryRun: false,                // If true, don't actually compress (for testing)
   debug: false                  // If true, log debug information
 }));
 ```
 
-Set `contextWindowOverride` to `0` or `null` to trust the context window reported by Codex. For a local `llama-server -c 73728`, keep it at `73728`; this prevents Codex Desktop metadata such as `258400` from making the used percentage look too low.
+Set `contextWindowOverride` to `0` or `null` to trust the context window reported by Codex. For a local `llama-server -c 73728`, prefer `providerContextWindowOverrides` or `modelContextWindowOverrides` instead of a global override; this prevents Codex Desktop metadata such as `258400` from making the used percentage look too low without incorrectly applying `73728` to GPT/OpenAI sessions.
+
+When `autoDiscoverContextWindow` is enabled, the script tries to discover a provider-reported context window from endpoints such as `/props`, `/v1/models`, and `/models`, then caches the result briefly. This works only when the provider exposes fields such as `context_length`, `max_context_length`, `max_model_len`, `n_ctx`, or `num_ctx` and the page is allowed to fetch that endpoint. If the provider does not expose the value or CORS blocks the request, use an override.
 
 With a `73728` context window, keep `thresholdUsedPercent` around `65`-`70`. Native compact still has to send the current conversation plus system/tool wrapper tokens, so waiting until `82%` can leave too little room and make the compact request itself exceed the server context. `minRemainingTokensBeforeCompact` provides an additional fixed safety buffer for third-party APIs whose real context window is smaller than Codex metadata reports.
 
@@ -77,7 +87,6 @@ With a `73728` context window, keep `thresholdUsedPercent` around `65`-`70`. Nat
    - Skips attempts while Codex appears busy if `onlyWhenIdle` is enabled
    - Uses a short retry delay instead of full cooldown when the compact trigger is temporarily missing
    - Verifies the result afterward and records `usage-reduced` or `usage-not-reduced`
-   - Shows a bottom-right `Auto compacting...` indicator while compaction is in progress
 
 3. **Conversation Isolation**: Each conversation is tracked independently with its own cooldown period to prevent excessive compression attempts.
 
@@ -100,6 +109,9 @@ window.__codexNativeAutoCompact.getState();
 
 // Get current configuration
 window.__codexNativeAutoCompact.readConfig();
+
+// Inspect provider context-window discovery cache
+window.__codexNativeAutoCompact.getContextWindowDiscovery();
 ```
 
 ## License
