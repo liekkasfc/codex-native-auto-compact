@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.3.2
+// @version      0.3.3
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -19,6 +19,7 @@
     pollIntervalMs: 5000,
     cooldownMs: 2 * 60 * 1000,
     missingTriggerRetryMs: 10 * 1000,
+    slashMenuOpenDelayMs: 650,
     menuOpenDelayMs: 650,
     confirmDelayMs: 650,
     onlyWhenIdle: true,
@@ -62,7 +63,7 @@
   if (window[INSTALL_KEY]) return;
   window[INSTALL_KEY] = true;
 
-  const COMPRESS_TEXT_RE = /压缩此对话的上下文|压缩上下文|压缩对话|compress this conversation|compact this conversation|compact context|compress context/i;
+  const COMPRESS_TEXT_RE = /压缩此(?:对话|会话)的上下文|压缩上下文|压缩(?:对话|会话)|compress this conversation|compact this conversation|compact context|compress context/i;
   const CONFIRM_TEXT_RE = /^(压缩|确认|继续|compress|compact|confirm|continue)$/i;
   const CONTEXT_TEXT_RE = /context|token|tokens|usage|window|budget|remaining|上下文|令牌|使用|窗口|压缩/i;
   const MENU_TRIGGER_TEXT_RE = /more|options|menu|open menu|ellipsis|更多|选项|菜单|操作|⋯|…/i;
@@ -709,6 +710,68 @@
     );
   }
 
+  function editableText(element) {
+    if (!element) return "";
+    if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) return element.value || "";
+    if (element.isContentEditable) return element.textContent || "";
+    return "";
+  }
+
+  function setEditableText(element, value) {
+    element.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: value, code: value === "/" ? "Slash" : undefined }));
+    if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+      const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+      if (setter) setter.call(element, value);
+      else element.value = value;
+      element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+      element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: value, code: value === "/" ? "Slash" : undefined }));
+      return true;
+    }
+
+    if (element?.isContentEditable) {
+      element.textContent = value;
+      element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+      element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: value, code: value === "/" ? "Slash" : undefined }));
+      return true;
+    }
+
+    return false;
+  }
+
+  function findComposerInput() {
+    const candidates = Array.from(document.querySelectorAll("textarea, input[type='text'], [contenteditable='true'], [role='textbox']"))
+      .filter((element) => element instanceof HTMLElement && visible(element) && !isDisabled(element))
+      .filter((element) => {
+        if (element instanceof HTMLInputElement && element.type !== "text") return false;
+        const label = elementText(element);
+        if (SEND_TEXT_RE.test(label)) return false;
+        return true;
+      });
+
+    candidates.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+    return candidates[0] || null;
+  }
+
+  async function openSlashCommandMenu(config) {
+    const input = findComposerInput();
+    if (!input) return { ok: false, code: "no-composer" };
+
+    const previousText = editableText(input);
+    if (previousText.trim()) return { ok: false, code: "composer-not-empty" };
+
+    input.focus();
+    if (!setEditableText(input, "/")) return { ok: false, code: "composer-not-editable" };
+    await sleep(Number(config.slashMenuOpenDelayMs || config.menuOpenDelayMs));
+    return {
+      ok: true,
+      input,
+      cleanup() {
+        if (editableText(input) === "/") setEditableText(input, "");
+      },
+    };
+  }
+
   function shortControlText(element) {
     const text = elementText(element);
     return text.length <= 80 ? text : "";
@@ -924,7 +987,23 @@
     }
 
     const trigger = findContextMenuTrigger();
-    if (!trigger) return { ok: false, route: "no-trigger", reason };
+    if (!trigger) {
+      const slashMenu = config.dryRun ? { ok: false, code: "dry-run" } : await openSlashCommandMenu(config);
+      if (!slashMenu.ok) return { ok: false, route: "no-trigger", reason, slashMenu: { ok: false, code: slashMenu.code } };
+
+      const slashCommand = findCompressCommand();
+      if (!slashCommand) {
+        slashMenu.cleanup?.();
+        return { ok: false, route: "slash-menu-no-command", reason, slashMenu: { ok: false, code: "no-command" } };
+      }
+
+      slashCommand.click();
+      await sleep(Number(config.confirmDelayMs));
+      const confirmButton = findConfirmButton();
+      if (confirmButton) confirmButton.click();
+      slashMenu.cleanup?.();
+      return { ok: true, route: "slash-command", reason };
+    }
 
     if (!config.dryRun) trigger.click();
     await sleep(Number(config.menuOpenDelayMs));
@@ -965,7 +1044,7 @@
         trigger: decision.code,
         source: reading.exact ? "react-graph" : "approximate",
       });
-      if (result.route === "no-trigger" || result.route === "opened-menu-no-command") {
+      if (result.route === "no-trigger" || result.route === "opened-menu-no-command" || result.route === "slash-menu-no-command") {
         state.lastMissingTriggerByConversationId.set(conversationId, Date.now());
       } else {
         state.lastAttemptByConversationId.set(conversationId, Date.now());
@@ -990,13 +1069,14 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.3.2",
+    version: "0.3.3",
     start,
     tick,
     readConfig,
     readUsage: getContextUsage,
     findCompressCommand,
     findContextMenuTrigger,
+    findComposerInput,
     getState() {
       return {
         running: state.running,
