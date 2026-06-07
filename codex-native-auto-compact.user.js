@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Native Auto Compact
 // @namespace    https://github.com/max/codex-native-auto-compact
-// @version      0.4.3
+// @version      0.4.4
 // @description  Automatically compresses Codex conversations when context usage is high.
 // @match        *://*/*
 // @grant        none
@@ -28,6 +28,7 @@
     contextWindowDiscoveryTimeoutMs: 1500,
     contextWindowDiscoveryTtlMs: 10 * 60 * 1000,
     minRemainingTokensBeforeCompact: 20000,
+    minRemainingTokensToAttemptCompact: 12000,
     pollIntervalMs: 5000,
     busyRetryMs: 1000,
     idleObserverDebounceMs: 150,
@@ -1280,6 +1281,24 @@
       };
     }
 
+    const minRemainingToAttempt = Number(config.minRemainingTokensToAttemptCompact);
+    if (
+      Number.isFinite(remainingTokens) &&
+      Number.isFinite(minRemainingToAttempt) &&
+      minRemainingToAttempt > 0 &&
+      remainingTokens < minRemainingToAttempt
+    ) {
+      return {
+        ok: false,
+        code: "too-late-for-compact",
+        percent,
+        threshold,
+        remainingTokens,
+        minRemainingTokens: Number.isFinite(minRemainingTokens) ? minRemainingTokens : null,
+        minRemainingTokensToAttemptCompact: minRemainingToAttempt,
+      };
+    }
+
     const lastAttemptAt = state.lastAttemptByConversationId.get(conversationId) || 0;
     const cooldownMs = Number(config.cooldownMs);
     const elapsedMs = Date.now() - lastAttemptAt;
@@ -1502,7 +1521,7 @@
 
   // Export API
   window[API_KEY] = {
-    version: "0.4.3",
+    version: "0.4.4",
     start,
     tick,
     readConfig,

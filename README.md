@@ -46,6 +46,7 @@ localStorage.setItem('codexNativeAutoCompactConfig', JSON.stringify({
   contextWindowDiscoveryTimeoutMs: 1500,
   contextWindowDiscoveryTtlMs: 600000,
   minRemainingTokensBeforeCompact: 20000, // Also compact when remaining tokens fall below this buffer
+  minRemainingTokensToAttemptCompact: 12000, // Stop retrying if too little room remains for the compact request itself
   pollIntervalMs: 5000,         // How often to check context usage (ms)
   busyRetryMs: 1000,            // Retry quickly when compact is pending but Codex is busy
   idleObserverDebounceMs: 150,  // Debounce DOM idle detection before retrying pending compact
@@ -82,6 +83,8 @@ Leave it as `null` for mixed-provider Codex sessions, because different models c
 When `autoDiscoverContextWindow` is enabled, the script tries to discover a provider-reported context window from endpoints such as `/props`, `/v1/models`, and `/models`, then caches the result briefly. This works only when the provider exposes fields such as `context_length`, `max_context_length`, `max_model_len`, `n_ctx`, or `num_ctx` and the page is allowed to fetch that endpoint. If the provider does not expose the value or CORS blocks the request, use an override.
 
 With a `73728` context window, keep `thresholdUsedPercent` around `65`-`70`. Native compact still has to send the current conversation plus system/tool wrapper tokens, so waiting until `82%` can leave too little room and make the compact request itself exceed the server context. `minRemainingTokensBeforeCompact` provides an additional fixed safety buffer for third-party APIs whose real context window is smaller than Codex metadata reports.
+
+If `remainingTokens` falls below `minRemainingTokensToAttemptCompact`, the script records `too-late-for-compact` and stops attempting automatic compaction for that tick. At that point the native compact request itself may no longer fit in the provider context window, so retrying can cause reconnect loops.
 
 ## How It Works
 
